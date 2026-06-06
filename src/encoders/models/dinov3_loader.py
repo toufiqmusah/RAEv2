@@ -1,9 +1,11 @@
 import os
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from torchvision import transforms
 
 
@@ -51,27 +53,110 @@ SHA_CHECKSUM = {
     "dinov3_vit7b16": "a955f4ea",
 }
 
+TIMM_MODEL_MAP = {
+    "dinov3_vits16": "vit_small_patch16_dinov3",
+    "dinov3_vits16plus": "vit_small_plus_patch16_dinov3",
+    "dinov3_vitb16": "vit_base_patch16_dinov3",
+    "dinov3_vitl16": "vit_large_patch16_dinov3",
+    "dinov3_vith16plus": "vit_huge_plus_patch16_dinov3",
+    "dinov3_vit7b16": "vit_7b_patch16_dinov3",
+}
 
-def load_dinov3(model_name):
+
+class _TimmDinov3Wrapper(nn.Module):
+    """Wraps a timm DINOv3 model to match the torch.hub interface (forward_features returns dict)."""
+
+    def __init__(self, timm_model):
+        super().__init__()
+        self.timm_model = timm_model
+        self.embed_dim = timm_model.embed_dim
+
+    @property
+    def norm(self):
+        return self.timm_model.norm
+
+    @norm.setter
+    def norm(self, value):
+        self.timm_model.norm = value
+
+    def forward_features(self, x):
+        out = self.timm_model.forward_features(x)
+        n_prefix = self.timm_model.num_prefix_tokens
+        cls_token = out[:, 0]
+        patch_tokens = out[:, n_prefix:]
+        return {
+            'x_norm_clstoken': cls_token,
+            'x_norm_patchtokens': patch_tokens,
+        }
+
+    def get_intermediate_layers(self, x, n, reshape=False, return_class_token=False, norm=True):
+        # timm Eva uses forward_intermediates (not get_intermediate_layers)
+        # Output from forward_intermediates is list of (B, C, H, W) tensors
+        _, intermediates = self.timm_model.forward_intermediates(
+            x, indices=n, norm=norm, return_prefix_tokens=return_class_token,
+        )
+        # Convert from NCHW to NL(C) format expected by the caller
+        result = []
+        for h in intermediates:
+            b, c, h_dim, w_dim = h.shape
+            h = h.reshape(b, c, -1).transpose(1, 2)  # (B, N, C)
+            result.append(h)
+        return result
+
+    def forward(self, x):
+        return self.timm_model(x)
+
+    def to(self, device):
+        self.timm_model = self.timm_model.to(device)
+        return self
+
+    def eval(self):
+        self.timm_model.eval()
+        return self
+
+    def requires_grad_(self, requires_grad=True):
+        self.timm_model.requires_grad_(requires_grad)
+        return self
+
+
+def _load_via_timm(model_name):
+    """Load DINOv3 via timm (HuggingFace-hosted weights)."""
+    import timm
+    timm_name = TIMM_MODEL_MAP[model_name]
+    model = timm.create_model(timm_name, pretrained=True)
+    model.eval()
+    return _TimmDinov3Wrapper(model)
+
+
+def load_dinov3(model_name, force_download: bool = False):
+    """Load a DINOv3 model by name.
+
+    Tries torch.hub first (local cache or Meta's dl.fbaipublicfiles.com),
+    falls back to timm (HuggingFace-hosted weights).
+
+    Args:
+        model_name: e.g. "dinov3_vitb16"
+        force_download: If True, skip local cache and download from official URL.
+    """
     assert model_name in MODEL_NAMES
     ckpt_dir = os.environ.get("DINOV3_CKPT_DIR", str(DEFAULT_CKPT_DIR))
-    weights = os.path.join(ckpt_dir, f"{model_name}_pretrain_lvd1689m-{SHA_CHECKSUM[model_name]}.pth")
+    weights_path = os.path.join(ckpt_dir, f"{model_name}_pretrain_lvd1689m-{SHA_CHECKSUM[model_name]}.pth")
+    weight_kwargs = {}
+    if not force_download and os.path.isfile(weights_path):
+        weight_kwargs['weights'] = weights_path
     repo_dir = os.environ.get("DINOV3_REPO_DIR")
     with _rank0_first():
-        if repo_dir and os.path.isfile(os.path.join(repo_dir, "hubconf.py")):
-            return torch.hub.load(
-                repo_dir,
-                model_name,
-                source="local",
-                trust_repo=True,
-                skip_validation=True,
-                weights=weights,
-            )
-        return torch.hub.load(
-            DINOV3_HUB_REF,
-            model_name,
-            source="github",
-            trust_repo=True,
-            skip_validation=True,
-            weights=weights,
-        )
+        if weight_kwargs or (repo_dir and os.path.isfile(os.path.join(repo_dir, "hubconf.py"))):
+            try:
+                if repo_dir and os.path.isfile(os.path.join(repo_dir, "hubconf.py")):
+                    return torch.hub.load(
+                        repo_dir, model_name, source="local",
+                        trust_repo=True, skip_validation=True, **weight_kwargs,
+                    )
+                return torch.hub.load(
+                    DINOV3_HUB_REF, model_name, source="github",
+                    trust_repo=True, skip_validation=True, **weight_kwargs,
+                )
+            except Exception as e:
+                warnings.warn(f"torch.hub load failed ({e}), falling back to timm")
+        return _load_via_timm(model_name)

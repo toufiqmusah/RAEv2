@@ -1,0 +1,3 @@
+[submodule "frd-score"]
+	path = frd-score
+	url = https://github.com/RichardObi/frd-score.git

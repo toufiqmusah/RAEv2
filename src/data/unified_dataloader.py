@@ -10,6 +10,8 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 
+from torchvision.datasets import ImageFolder
+
 from .imagenet_hf_dataset import ImageNetHFDataset
 
 T2I_HF_DATASETS = {'mscoco', 'mjhq', 'geneval', 'dpgbench', 'genaibench', 'simpleeval', 'sft_hack_datasets'}
@@ -223,6 +225,10 @@ def prepare_unified_dataloader(
         result = _prepare_nwm_loader(
             config, image_size, batch_size, num_workers, rank, world_size, transform, shuffle
         )
+    elif target == "folder":
+        result = _prepare_folder_loader(
+            config, image_size, batch_size, num_workers, rank, world_size, transform, shuffle
+        )
     else:
         raise ValueError(f"Unknown dataset target: {target!r}")
     result.virtual_epoch_steps = virtual_epoch_steps
@@ -423,6 +429,49 @@ def _prepare_imagenet_loader(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=shuffle,  # drop_last=True for train, False for eval
+        persistent_workers=num_workers > 0,
+        multiprocessing_context="spawn" if num_workers > 0 else None,
+    )
+
+    return DataloaderResult(
+        loader=loader,
+        sampler=sampler,
+        dataset_size=len(dataset),
+        is_iterable=False,
+    )
+
+
+def _prepare_folder_loader(
+    config: dict,
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+    rank: int,
+    world_size: int,
+    transform: Optional[transforms.Compose],
+    shuffle: bool = True,
+) -> DataloaderResult:
+    """Prepare a local folder dataset using ImageFolder."""
+    data_dir = config.get("data_dir")
+    if data_dir is None:
+        raise ValueError("folder target requires `data_dir` in config")
+
+    if transform is None:
+        transform = transforms.Compose([
+            transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.ToTensor(),
+        ])
+
+    dataset = ImageFolder(str(data_dir), transform=transform)
+
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=shuffle,
         persistent_workers=num_workers > 0,
         multiprocessing_context="spawn" if num_workers > 0 else None,
     )

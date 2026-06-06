@@ -500,6 +500,240 @@ class SigLIP2MultiLayerSimpleAddEncoder(SigLIP2Encoder):
         }
 
 
+class MedSigLIPEncoder(VisionEncoder):
+    """MedSigLIP-L encoder from Google (medical SigLIP).
+
+    HF model: google/medsiglip-448
+    - 448px input, patch 14, 1152 hidden dim, 27 layers
+    - Uses CLIP-style normalization
+    - Returns patch tokens only (no CLS token)
+    """
+
+    CLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
+    CLIP_DEFAULT_STD = (0.26862954, 0.26130258, 0.27577711)
+
+    def load_model(self):
+        from transformers import SiglipVisionModel
+
+        self.model = SiglipVisionModel.from_pretrained('google/medsiglip-448')
+        # Remove post-layernorm affine (matches MedSigLIP2wNorm legacy)
+        self.model.post_layernorm.elementwise_affine = False
+        self.model.post_layernorm.weight = None
+        self.model.post_layernorm.bias = None
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        self.patch_size = 14
+        self._embed_dim = self.model.config.hidden_size  # 1152
+
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        x = x / 255.
+        x = Normalize(self.CLIP_DEFAULT_MEAN, self.CLIP_DEFAULT_STD)(x)
+        x = torch.nn.functional.interpolate(x, 448, mode='bicubic')
+        return x
+
+    def forward_features(self, x: torch.Tensor) -> Dict[str, Optional[torch.Tensor]]:
+        out = self.model(x, output_hidden_states=False)
+        patch_tokens = out.last_hidden_state  # (B, N, C), no CLS
+        return {
+            'x_norm_clstoken': None,
+            'x_norm_patchtokens': patch_tokens,
+        }
+
+
+class MedSigLIPMLSEncoder(MedSigLIPEncoder):
+    """MedSigLIP-L with Multi-Layer Sum (MLS).
+
+    Sums the last K transformer layers (per RAEv2 paper §1.1).
+    Config syntax (in model_config):
+        'l[K=7]'     — sum last 7 layers
+        'l[layers=21.22.23.24.25.26.27]'  — explicit layer indices
+    Default K=1 (same as base MedSigLIP).
+    """
+
+    DEFAULT_K = 1
+    NUM_LAYERS = 27  # MedSigLIP-L has 27 transformer layers
+
+    def _parse_config(self):
+        import re
+        cfg = self.model_config
+        # Strip 'vit-' prefix if present
+        cfg = re.sub(r'^vit-', '', cfg)
+        return cfg  # just the base part, flags parsed in load_model
+
+    def load_model(self):
+        import re
+        from transformers import SiglipVisionModel
+
+        self.model = SiglipVisionModel.from_pretrained('google/medsiglip-448')
+        self.model.post_layernorm.elementwise_affine = False
+        self.model.post_layernorm.weight = None
+        self.model.post_layernorm.bias = None
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        self.patch_size = 14
+        self._embed_dim = self.model.config.hidden_size
+        self._num_hidden_layers = self.model.config.num_hidden_layers
+
+        # Parse flags from model_config after stripping known base
+        cfg = self.model_config
+        cfg = re.sub(r'^vit-', '', cfg)
+        match = re.match(r'^[a-z]+(?:\[([^\]]+)\])?$', cfg)
+
+        self.layer_indices = None
+        if match and match.group(1):
+            flags_str = match.group(1)
+            for part in flags_str.split(','):
+                part = part.strip()
+                if part.startswith('layers='):
+                    self.layer_indices = [int(i) for i in part.split('=')[1].split('.')]
+                elif part.startswith('K='):
+                    K = int(part.split('=')[1])
+                    self.layer_indices = list(range(
+                        self._num_hidden_layers - K, self._num_hidden_layers
+                    ))
+
+        if self.layer_indices is None:
+            # Default: last K layers where K=DEFAULT_K
+            K = self.DEFAULT_K
+            self.layer_indices = list(range(
+                self._num_hidden_layers - K, self._num_hidden_layers
+            ))
+
+    def forward_features(self, x: torch.Tensor) -> Dict[str, Optional[torch.Tensor]]:
+        # hidden_states: tuple of length N+1
+        #   hs[0]   = patch embedding
+        #   hs[k]   for k in 1..N = output of block k-1 (pre-post_layernorm)
+        #   hs[N]   = post_layernorm(output of block N-1) = last_hidden_state
+        hs = self.model(x, output_hidden_states=True).hidden_states
+        post_ln = self.model.post_layernorm
+        N = self._num_hidden_layers
+
+        outputs = []
+        for li in self.layer_indices:
+            if li == N - 1:
+                outputs.append(hs[N])
+            else:
+                outputs.append(post_ln(hs[li + 1]))
+
+        # Sum (not average) per RAEv2 MLS paper
+        patch_tokens = torch.stack(outputs, dim=0).sum(dim=0)
+        return {
+            'x_norm_clstoken': None,
+            'x_norm_patchtokens': patch_tokens,
+        }
+
+
+class BiomedCLIPEncoder(VisionEncoder):
+    """BiomedCLIP-B encoder from Microsoft.
+
+    HF model: microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224
+    - 224px input, patch 16, 768 hidden dim (ViT-B/16 trunk), 12 layers
+    - Loads via open_clip; uses trunk (timm ViT) for patch token extraction
+    - Returns patch tokens (drops CLS token)
+    """
+
+    BIOMEDCLIP_ID = "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    CLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
+    CLIP_DEFAULT_STD = (0.26862954, 0.26130258, 0.27577711)
+
+    def load_model(self):
+        import open_clip
+        model, _, _ = open_clip.create_model_and_transforms(
+            'hf-hub:' + self.BIOMEDCLIP_ID
+        )
+        # Use the timm VisionTransformer trunk directly (gives patch tokens)
+        self.model = model.visual.trunk
+        self.model.requires_grad_(False)
+        # Remove layernorm affine
+        if hasattr(self.model, 'norm'):
+            self.model.norm = nn.LayerNorm(self.model.norm.normalized_shape[0], elementwise_affine=False)
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        self.patch_size = 16
+        self._embed_dim = self.model.embed_dim  # 768 (ViT-B/16)
+
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        x = x / 255.
+        x = Normalize(self.CLIP_DEFAULT_MEAN, self.CLIP_DEFAULT_STD)(x)
+        x = torch.nn.functional.interpolate(x, 224, mode='bicubic')
+        return x
+
+    def forward_features(self, x: torch.Tensor) -> Dict[str, Optional[torch.Tensor]]:
+        out = self.model.forward_features(x)  # (B, N+1, C) with CLS
+        patch_tokens = out[:, 1:]  # drop CLS token
+        return {
+            'x_norm_clstoken': None,
+            'x_norm_patchtokens': patch_tokens,
+        }
+
+
+class BiomedCLIPMLSEncoder(BiomedCLIPEncoder):
+    """BiomedCLIP-B with Multi-Layer Sum (MLS).
+
+    Sums the last K transformer layers via the timm trunk's
+    get_intermediate_layers (which returns patch tokens without CLS).
+    Config syntax:
+        'b[K=4]'             — sum last 4 layers
+        'b[layers=8.9.10.11]'  — explicit layer indices (0-indexed)
+    Default K=1.
+    """
+
+    DEFAULT_K = 1
+    NUM_LAYERS = 12  # ViT-B has 12 layers
+
+    def load_model(self):
+        import re
+        import open_clip
+        model, _, _ = open_clip.create_model_and_transforms(
+            'hf-hub:' + self.BIOMEDCLIP_ID
+        )
+        self.model = model.visual.trunk
+        self.model.requires_grad_(False)
+        if hasattr(self.model, 'norm'):
+            self.model.norm = nn.LayerNorm(self.model.norm.normalized_shape[0], elementwise_affine=False)
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        self.patch_size = 16
+        self._embed_dim = self.model.embed_dim  # 768
+        self._num_hidden_layers = 12
+
+        # Parse flags
+        cfg = self.model_config
+        cfg = re.sub(r'^vit-', '', cfg)
+        match = re.match(r'^[a-z]+(?:\[([^\]]+)\])?$', cfg)
+
+        self.layer_indices = None
+        if match and match.group(1):
+            flags_str = match.group(1)
+            for part in flags_str.split(','):
+                part = part.strip()
+                if part.startswith('layers='):
+                    self.layer_indices = [int(i) for i in part.split('=')[1].split('.')]
+                elif part.startswith('K='):
+                    K = int(part.split('=')[1])
+                    self.layer_indices = list(range(
+                        self._num_hidden_layers - K, self._num_hidden_layers
+                    ))
+
+        if self.layer_indices is None:
+            K = self.DEFAULT_K
+            self.layer_indices = list(range(
+                self._num_hidden_layers - K, self._num_hidden_layers
+            ))
+
+    def forward_features(self, x: torch.Tensor) -> Dict[str, Optional[torch.Tensor]]:
+        # timm trunk.get_intermediate_layers returns list of (B, N, C) patch tokens only
+        outputs = self.model.get_intermediate_layers(
+            x, n=self.layer_indices, reshape=False, norm=True
+        )
+        # Sum selected layers (per RAEv2 MLS: sum, not average)
+        patch_tokens = torch.stack(outputs, dim=0).sum(dim=0)
+        return {
+            'x_norm_clstoken': None,
+            'x_norm_patchtokens': patch_tokens,
+        }
+
+
 class MAEEncoder(VisionEncoder):
     """MAE (Masked Autoencoder) encoder implementation.
 
@@ -876,6 +1110,38 @@ class JEPAEncoder(VisionEncoder):
         }
 
 
+class MedVAEEncoder(VisionEncoder):
+    """MedVAE encoder — uses MedVAE's pretrained convolutional encoder trunk.
+
+    HF: stanfordmimi/MedVAE
+    Extracts mid-block features (before final conv_out → VAE bottleneck).
+    Model config syntax:
+        '4_3_2d'   — medvae_4_3_2d: 4x spatial compression, 3-ch, 2D
+        '8_4_2d'   — medvae_8_4_2d: 8x spatial compression, 4-ch, 2D
+    """
+
+    MEDVAE_MEAN = (0.5, 0.5, 0.5)
+    MEDVAE_STD = (0.5, 0.5, 0.5)
+
+    def load_model(self):
+        from encoders.models.medvae_encoder import load_medvae
+        model_config = self.model_config
+        medvae_name = f"medvae_{model_config}"
+        self.model = load_medvae(medvae_name, target_dim=512, modality='xray')
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        self.patch_size = None  # convolutional, no patch embedding
+        self._embed_dim = 512
+
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        x = x / 255.
+        x = Normalize(self.MEDVAE_MEAN, self.MEDVAE_STD)(x)
+        return x
+
+    def forward_features(self, x: torch.Tensor) -> Dict[str, Optional[torch.Tensor]]:
+        return self.model.forward_features(x)
+
+
 # Registry mapping encoder types to classes
 ENCODER_REGISTRY = {
     # dinov2 and dinov3 encoders
@@ -897,6 +1163,12 @@ ENCODER_REGISTRY = {
     'eupemls': EUPEMultiLayerSimpleAddEncoder,
     # TIPS encoders
     'tipsv2': TIPSEncoder,
+    # medical encoders
+    'medsiglip': MedSigLIPEncoder,
+    'medsiglipmls': MedSigLIPMLSEncoder,
+    'biomedclip': BiomedCLIPEncoder,
+    'biomedclipmls': BiomedCLIPMLSEncoder,
+    'medvae': MedVAEEncoder,
     # supervised / contrastive encoders
     'clip': CLIPEncoder,
     'mocov3': MoCoV3Encoder,
