@@ -19,3 +19,6 @@ repos:
         language: system
         files: ^(src|configs|scripts)/.*\.py$
         require_serial: true
+
+
+# ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null

@@ -481,7 +481,7 @@ class SigLIP2MultiLayerSimpleAddEncoder(SigLIP2Encoder):
         # Apply post_layernorm to non-final selected blocks to match DINOv3-mls
         # (norm=True) semantics; for the final block, hs[N] is already normed.
         hs = self.model(x, output_hidden_states=True).hidden_states
-        post_ln = self.model.vision_model.post_layernorm
+        post_ln = getattr(self.model, 'post_layernorm', None) or getattr(self.model.vision_model, 'post_layernorm', None)
         N = self._num_hidden_layers
 
         outputs = []
@@ -516,10 +516,11 @@ class MedSigLIPEncoder(VisionEncoder):
         from transformers import SiglipVisionModel
 
         self.model = SiglipVisionModel.from_pretrained('google/medsiglip-448')
-        # Remove post-layernorm affine (matches MedSigLIP2wNorm legacy)
-        self.model.post_layernorm.elementwise_affine = False
-        self.model.post_layernorm.weight = None
-        self.model.post_layernorm.bias = None
+        # post_layernorm moved to vision_model in transformers >= 4.57
+        ln = getattr(self.model, 'post_layernorm', None) or getattr(self.model.vision_model, 'post_layernorm', None)
+        ln.elementwise_affine = False
+        ln.weight = None
+        ln.bias = None
         self.model = self.model.to(self.device)
         self.model.eval()
         self.patch_size = 14
@@ -565,9 +566,10 @@ class MedSigLIPMLSEncoder(MedSigLIPEncoder):
         from transformers import SiglipVisionModel
 
         self.model = SiglipVisionModel.from_pretrained('google/medsiglip-448')
-        self.model.post_layernorm.elementwise_affine = False
-        self.model.post_layernorm.weight = None
-        self.model.post_layernorm.bias = None
+        ln = getattr(self.model, 'post_layernorm', None) or getattr(self.model.vision_model, 'post_layernorm', None)
+        ln.elementwise_affine = False
+        ln.weight = None
+        ln.bias = None
         self.model = self.model.to(self.device)
         self.model.eval()
         self.patch_size = 14
@@ -605,7 +607,7 @@ class MedSigLIPMLSEncoder(MedSigLIPEncoder):
         #   hs[k]   for k in 1..N = output of block k-1 (pre-post_layernorm)
         #   hs[N]   = post_layernorm(output of block N-1) = last_hidden_state
         hs = self.model(x, output_hidden_states=True).hidden_states
-        post_ln = self.model.post_layernorm
+        post_ln = getattr(self.model, 'post_layernorm', None) or getattr(self.model.vision_model, 'post_layernorm', None)
         N = self._num_hidden_layers
 
         outputs = []
